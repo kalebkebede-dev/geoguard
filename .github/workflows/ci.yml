@@ -9,18 +9,45 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+
+    # tests/test_api.py needs a real Postgres+PostGIS connection (the naive
+    # lat/lon filter is a real SQL query, not mocked) — this service container
+    # gives the job one, matching the local docker-compose.yml setup.
+    services:
+      postgres:
+        image: postgis/postgis:16-3.4
+        env:
+          POSTGRES_USER: geoguard
+          POSTGRES_PASSWORD: geoguard_dev_password
+          POSTGRES_DB: geoguard
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      # No .env file exists in CI (it's gitignored) — both app/db/session.py
+      # and migrations/env.py read this from the real process environment.
+      DATABASE_URL: postgresql://geoguard:geoguard_dev_password@localhost:5432/geoguard
+
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Run database migrations
+        run: alembic upgrade head
 
       - name: Run tests
         run: pytest -v

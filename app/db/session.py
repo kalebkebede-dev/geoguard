@@ -17,3 +17,15 @@ load_dotenv()
 DATABASE_URL = os.getenv("DATABASE_URL")
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
+
+
+def get_db():
+    """
+    FastAPI dependency: yields one Session per request, and guarantees it's
+    closed afterward even if the endpoint raises. Used via Depends(get_db).
+    """
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()

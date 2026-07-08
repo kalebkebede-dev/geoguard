@@ -12,7 +12,7 @@ index on the geometry column) — that index is what your Week 4 benchmark
 will measure against a naive lat/lon range filter.
 """
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import declarative_base
 from geoalchemy2 import Geometry  # pip install geoalchemy2
 
@@ -50,6 +50,21 @@ class Reading(Base):
     )
 
 
-# TODO (Week 3): add an Alembic setup (`alembic init migrations`) so schema
-# changes are tracked instead of hand-edited against a live database. This
-# is a real gap in "production practices" if it's missing.
+class IngestionRun(Base):
+    """
+    One row per ingestion run — the /health endpoint's data source. Written
+    at the end of every run, success or failure, so /health can report
+    whether the last run succeeded and how long ago it was.
+    """
+
+    __tablename__ = "ingestion_runs"
+
+    id = Column(Integer, primary_key=True)
+    started_at = Column(DateTime, nullable=False)
+    completed_at = Column(DateTime, nullable=False)
+    success = Column(Boolean, nullable=False)
+    fetched_count = Column(Integer, nullable=False, default=0)
+    new_count = Column(Integer, nullable=False, default=0)
+    updated_count = Column(Integer, nullable=False, default=0)
+    error_count = Column(Integer, nullable=False, default=0)
+    error_message = Column(String, nullable=True)

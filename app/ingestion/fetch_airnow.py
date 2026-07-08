@@ -9,11 +9,12 @@ Look at the "Current Observations by Lat/Long" endpoint to start.
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
 
+from app.db.models import IngestionRun
 from app.db.persistence import save_reading
 from app.db.session import SessionLocal
 
@@ -99,16 +100,46 @@ def normalize_reading(raw_reading: dict) -> dict:
     }
 
 
+def _record_run(session, started_at, success, fetched_count=0, new_count=0,
+                 updated_count=0, error_count=0, error_message=None):
+    """Write one row to ingestion_runs — the /health endpoint's data source."""
+    session.add(IngestionRun(
+        started_at=started_at,
+        completed_at=datetime.now(timezone.utc).replace(tzinfo=None),
+        success=success,
+        fetched_count=fetched_count,
+        new_count=new_count,
+        updated_count=updated_count,
+        error_count=error_count,
+        error_message=error_message,
+    ))
+
+
 def run_ingestion(lat: float, lon: float) -> None:
     """
     Fetch current observations for one location and persist them. A single
     malformed reading is logged and skipped — it must not abort the rest
-    of the batch.
+    of the batch. Every run, success or failure, writes one row to
+    ingestion_runs for /health to report on.
     """
-    raw_readings = fetch_current_observations(lat, lon)
+    started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    session = SessionLocal()
+
+    try:
+        raw_readings = fetch_current_observations(lat, lon)
+    except Exception as exc:
+        # Fetch itself failed even after retries — a real run failure, not a
+        # per-reading issue. Record it so /health can report it, then let the
+        # exception propagate so the process still exits non-zero (visible
+        # to whatever scheduler is watching, e.g. GitHub Actions cron later).
+        logger.error("Ingestion run failed before fetching any data: %s", exc)
+        _record_run(session, started_at, success=False, error_message=str(exc))
+        session.commit()
+        session.close()
+        raise
+
     logger.info("Fetched %d raw readings for (%s, %s)", len(raw_readings), lat, lon)
 
-    session = SessionLocal()
     new_count = 0
     updated_count = 0
     error_count = 0
@@ -132,6 +163,19 @@ def run_ingestion(lat: float, lon: float) -> None:
         else:
             updated_count += 1
 
+    # success=True here even if some individual readings errored out — that's
+    # the per-record resilience working as designed, not a run failure. A
+    # malformed record and a fully broken run are different signals; error_count
+    # surfaces the former without conflating it with the latter.
+    _record_run(
+        session,
+        started_at,
+        success=True,
+        fetched_count=len(raw_readings),
+        new_count=new_count,
+        updated_count=updated_count,
+        error_count=error_count,
+    )
     session.commit()
     session.close()
 

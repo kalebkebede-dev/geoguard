@@ -6,13 +6,27 @@ Auto-generated docs will be at http://127.0.0.1:8000/docs — useful for testing
 and a good thing to screenshot for your README later.
 """
 
-from fastapi import FastAPI
+import math
+from datetime import datetime, timedelta, timezone
+
+from fastapi import Depends, FastAPI
+from sqlalchemy.orm import Session
+
+from app.db.models import IngestionRun, Reading, Station
+from app.db.session import get_db
+
+MILES_PER_DEGREE_LATITUDE = 69.0
 
 app = FastAPI(
     title="Wildfire & Air Quality Risk API",
     description="Real-time air quality and wildfire risk data.",
     version="0.1.0",
 )
+
+# Placeholder until the real GitHub Actions cron schedule is set (Week 3/4) —
+# AirNow updates roughly hourly, so 2 hours gives a buffer before flagging
+# unhealthy. Tune this once the actual scheduled interval is fixed.
+HEALTHY_INTERVAL = timedelta(hours=2)
 
 
 @app.get("/")
@@ -21,30 +35,81 @@ def root():
 
 
 @app.get("/health")
-def health():
+def health(db: Session = Depends(get_db)):
     """
-    Week 3 goal: this is your pipeline-observability signal, and almost no
-    student project has one — it's a cheap, high-value addition.
+    Reports whether the last ingestion run succeeded and how long ago it
+    was — see app.ingestion.fetch_airnow.run_ingestion, which writes one
+    ingestion_runs row per run, success or failure.
+    """
+    last_run = db.query(IngestionRun).order_by(IngestionRun.completed_at.desc()).first()
 
-    TODO: Query the database for the most recent ingestion run (you'll need
-    to record run metadata somewhere — e.g., a simple `ingestion_runs` table
-    with a timestamp and row count written at the end of every run). Return
-    whether the last run succeeded and how long ago it was. If it's been
-    longer than your scheduled interval plus some buffer, this should report
-    unhealthy, not just "ok" by default.
-    """
-    raise NotImplementedError("Report last successful ingestion run status")
+    if last_run is None:
+        return {"status": "unhealthy", "detail": "no ingestion runs recorded yet"}
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    time_since_last_run = now - last_run.completed_at
+    healthy = last_run.success and time_since_last_run <= HEALTHY_INTERVAL
+
+    return {
+        "status": "healthy" if healthy else "unhealthy",
+        "minutes_since_last_run": round(time_since_last_run.total_seconds() / 60, 1),
+        "last_run": {
+            "completed_at": last_run.completed_at.isoformat(),
+            "success": last_run.success,
+            "fetched_count": last_run.fetched_count,
+            "new_count": last_run.new_count,
+            "updated_count": last_run.updated_count,
+            "error_count": last_run.error_count,
+            "error_message": last_run.error_message,
+        },
+    }
 
 
 @app.get("/aqi/current")
-def current_aqi(lat: float, lon: float):
+def current_aqi(lat: float, lon: float, radius_miles: float = 25, db: Session = Depends(get_db)):
     """
-    TODO: Query your database for the most recent reading(s) near this
-    lat/lon (this is where PostGIS earns its place — a radius query).
-    Return AQI value, category (Good/Moderate/Unhealthy/etc.), and the
-    station it came from.
+    Naive lat/lon filter: pull all stations, filter to a bounding box in
+    Python. This is the deliberately-unsophisticated Week 3 baseline that
+    BENCHMARKS.md measures against — Week 4 replaces this with a PostGIS
+    ST_DWithin query and records the real before/after numbers.
     """
-    raise NotImplementedError("Query the database and return current AQI")
+    lat_delta = radius_miles / MILES_PER_DEGREE_LATITUDE
+    lon_delta = radius_miles / (MILES_PER_DEGREE_LATITUDE * math.cos(math.radians(lat)))
+
+    stations = db.query(Station).all()
+    nearby_stations = [
+        s for s in stations
+        if (lat - lat_delta) <= s.latitude <= (lat + lat_delta)
+        and (lon - lon_delta) <= s.longitude <= (lon + lon_delta)
+    ]
+
+    readings = []
+    for station in nearby_stations:
+        station_readings = (
+            db.query(Reading)
+            .filter(Reading.station_id == station.id)
+            .order_by(Reading.observed_at.desc())
+            .all()
+        )
+        # station_readings is newest-first, so the first time we see a given
+        # pollutant here is guaranteed to be its most recent reading.
+        seen_pollutants = set()
+        for reading in station_readings:
+            if reading.pollutant in seen_pollutants:
+                continue
+            seen_pollutants.add(reading.pollutant)
+            readings.append({
+                "station_name": station.name,
+                "station_external_id": station.external_id,
+                "latitude": station.latitude,
+                "longitude": station.longitude,
+                "pollutant": reading.pollutant,
+                "aqi_value": reading.aqi_value,
+                "category": reading.category,
+                "observed_at": reading.observed_at.isoformat(),
+            })
+
+    return {"count": len(readings), "readings": readings}
 
 
 @app.get("/aqi/history")

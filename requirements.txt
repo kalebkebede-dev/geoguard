@@ -8,3 +8,4 @@ requests
 pytest
 python-dotenv
 pandas
+httpx2
