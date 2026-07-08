@@ -12,7 +12,7 @@ index on the geometry column) — that index is what your Week 4 benchmark
 will measure against a naive lat/lon range filter.
 """
 
-from sqlalchemy import Column, Integer, String, Float, DateTime, UniqueConstraint
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import declarative_base
 from geoalchemy2 import Geometry  # pip install geoalchemy2
 
@@ -36,7 +36,7 @@ class Reading(Base):
     __tablename__ = "readings"
 
     id = Column(Integer, primary_key=True)
-    station_id = Column(Integer, nullable=False)  # FK to Station, add ForeignKey
+    station_id = Column(Integer, ForeignKey("stations.id"), nullable=False)
     pollutant = Column(String, nullable=False)  # e.g. "PM2.5", "O3"
     aqi_value = Column(Integer, nullable=False)
     category = Column(String)  # Good / Moderate / Unhealthy / etc.

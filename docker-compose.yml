@@ -1,0 +1,15 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: geoguard-db
+    environment:
+      POSTGRES_USER: geoguard
+      POSTGRES_PASSWORD: geoguard_dev_password
+      POSTGRES_DB: geoguard
+    ports:
+      - "5432:5432"
+    volumes:
+      - geoguard_pgdata:/var/lib/postgresql/data
+
+volumes:
+  geoguard_pgdata:

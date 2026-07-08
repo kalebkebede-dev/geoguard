@@ -6,14 +6,26 @@ AirNow API docs: https://docs.airnowapi.org/
 Look at the "Current Observations by Lat/Long" endpoint to start.
 """
 
+import logging
 import os
+import time
+from datetime import datetime
+
 import requests
 from dotenv import load_dotenv
 
+from app.db.persistence import save_reading
+from app.db.session import SessionLocal
+
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 AIRNOW_API_KEY = os.getenv("AIRNOW_API_KEY")
 AIRNOW_BASE_URL = "https://www.airnowapi.org/aq/observation/latLong/current/"
+
+MAX_ATTEMPTS = 3
+INITIAL_BACKOFF_SECONDS = 1  # doubles each retry: 1s, 2s, 4s
 
 
 def fetch_current_observations(lat: float, lon: float, distance_miles: int = 25) -> list[dict]:
@@ -29,7 +41,37 @@ def fetch_current_observations(lat: float, lon: float, distance_miles: int = 25)
     don't let this crash silently. Decide what "no data" should look like to
     the rest of the pipeline.
     """
-    raise NotImplementedError("Implement the AirNow API call here")
+    params = {
+        "format": "application/json",
+        "latitude": lat,
+        "longitude": lon,
+        "distance": distance_miles,
+        "API_KEY": AIRNOW_API_KEY,
+    }
+
+    backoff = INITIAL_BACKOFF_SECONDS
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            response = requests.get(AIRNOW_BASE_URL, params=params, timeout=10)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else None
+            if status is not None and 400 <= status < 500:
+                logger.error("AirNow rejected the request (HTTP %s) — not retrying: %s", status, exc)
+                raise
+            if attempt == MAX_ATTEMPTS:
+                logger.error("AirNow still failing after %s attempts (HTTP %s): %s", MAX_ATTEMPTS, status, exc)
+                raise
+            logger.warning("AirNow returned HTTP %s, retrying (attempt %s/%s)", status, attempt, MAX_ATTEMPTS)
+        except requests.exceptions.RequestException as exc:
+            if attempt == MAX_ATTEMPTS:
+                logger.error("Network error calling AirNow after %s attempts: %s", MAX_ATTEMPTS, exc)
+                raise
+            logger.warning("Network error calling AirNow, retrying (attempt %s/%s): %s", attempt, MAX_ATTEMPTS, exc)
+
+        time.sleep(backoff)
+        backoff *= 2
 
 
 def normalize_reading(raw_reading: dict) -> dict:
@@ -42,13 +84,69 @@ def normalize_reading(raw_reading: dict) -> dict:
     data source (e.g., NASA FIRMS) later — normalize everything to one
     consistent shape before it reaches storage.
     """
-    raise NotImplementedError("Implement normalization here")
+    observed_at = datetime.strptime(raw_reading["DateObserved"].strip(), "%Y-%m-%d").replace(
+        hour=raw_reading["HourObserved"]
+    )
+    return {
+        "station_id": f"{raw_reading['ReportingArea']}, {raw_reading['StateCode']}",
+        "station_name": raw_reading["ReportingArea"],
+        "latitude": raw_reading["Latitude"],
+        "longitude": raw_reading["Longitude"],
+        "pollutant": raw_reading["ParameterName"],
+        "aqi_value": raw_reading["AQI"],
+        "category": raw_reading["Category"]["Name"],
+        "observed_at": observed_at,
+    }
+
+
+def run_ingestion(lat: float, lon: float) -> None:
+    """
+    Fetch current observations for one location and persist them. A single
+    malformed reading is logged and skipped — it must not abort the rest
+    of the batch.
+    """
+    raw_readings = fetch_current_observations(lat, lon)
+    logger.info("Fetched %d raw readings for (%s, %s)", len(raw_readings), lat, lon)
+
+    session = SessionLocal()
+    new_count = 0
+    updated_count = 0
+    error_count = 0
+
+    for raw in raw_readings:
+        try:
+            # A SAVEPOINT scoped to just this reading: session.rollback() would
+            # undo the *entire* transaction, including earlier readings in this
+            # same batch that already succeeded. begin_nested() means a failure
+            # here only undoes this one reading, leaving the rest of the batch intact.
+            with session.begin_nested():
+                reading = normalize_reading(raw)
+                is_new = save_reading(session, reading)
+        except Exception:
+            error_count += 1
+            logger.exception("Skipping malformed reading: %r", raw)
+            continue
+
+        if is_new:
+            new_count += 1
+        else:
+            updated_count += 1
+
+    session.commit()
+    session.close()
+
+    logger.info(
+        "Ingestion run complete: %d fetched, %d new, %d updated, %d errors",
+        len(raw_readings), new_count, updated_count, error_count,
+    )
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
     # Quick manual test while building: pick a real lat/lon (e.g., Seattle)
     # and confirm you get real data back before wiring up anything else.
     test_lat, test_lon = 47.6062, -122.3321
-    readings = fetch_current_observations(test_lat, test_lon)
-    for r in readings:
-        print(normalize_reading(r))
+    run_ingestion(test_lat, test_lon)
