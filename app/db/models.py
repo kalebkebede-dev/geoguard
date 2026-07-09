@@ -27,9 +27,12 @@ class Station(Base):
     name = Column(String)
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
-    # TODO: add a PostGIS geometry column (Point) generated from lat/lon,
-    # e.g.: location = Column(Geometry(geometry_type="POINT", srid=4326))
-    # This is the column your spatial index and ST_DWithin queries will use.
+    # Populated from longitude/latitude in app/db/persistence.py whenever a
+    # Station is created. Nullable at the schema level only because the
+    # migration backfills existing rows before tightening this to NOT NULL —
+    # see migrations/versions for the add-column -> backfill -> not-null
+    # sequence. This is what the GiST index and ST_DWithin queries use.
+    location = Column(Geometry(geometry_type="POINT", srid=4326), nullable=False)
 
 
 class Reading(Base):

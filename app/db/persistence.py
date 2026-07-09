@@ -6,6 +6,7 @@ duplicates or corrupts data. See models.py for why the upsert targets
 uq_reading_identity.
 """
 
+from geoalchemy2.elements import WKTElement
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -28,6 +29,10 @@ def get_or_create_station(session: Session, reading: dict) -> Station:
         name=reading["station_name"],
         latitude=reading["latitude"],
         longitude=reading["longitude"],
+        # WKT POINT is (longitude latitude) — X Y order, the reverse of how
+        # "lat/lon" is normally said out loud. Swapping this is a classic,
+        # silent geospatial bug: it produces a valid point, just the wrong one.
+        location=WKTElement(f"POINT({reading['longitude']} {reading['latitude']})", srid=4326),
     )
     session.add(station)
     session.flush()  # assigns station.id via the DB sequence, without committing

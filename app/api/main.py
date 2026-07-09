@@ -10,12 +10,41 @@ import math
 from datetime import datetime, timedelta, timezone
 
 from fastapi import Depends, FastAPI
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from app.db.models import IngestionRun, Reading, Station
 from app.db.session import get_db
 
 MILES_PER_DEGREE_LATITUDE = 69.0
+METERS_PER_MILE = 1609.34
+
+# Verified against EXPLAIN ANALYZE before adopting this shape — an earlier
+# version that only cast to ::geography (matching BENCHMARKS.md's original
+# sketch) turned out to force a Seq Scan: Station.location is stored as
+# geometry (SRID 4326, native units = degrees), and Postgres can't use a
+# GiST index built on the raw geometry column to accelerate a filter
+# expressed against a cast (::geography) version of that column.
+#
+# The fix, and the standard PostGIS idiom for this exact situation: a cheap
+# `&&` bounding-box check directly on the raw indexed geometry column (which
+# reliably uses the GiST index) narrows candidates first, then the precise
+# ::geography ST_DWithin (accurate real-world meters, unlike a plain
+# geometry-space degree distance) filters that small candidate set.
+#
+# Kept as a raw SQL string (not the ORM) so the exact same query can be
+# re-run with EXPLAIN ANALYZE when verifying index usage — no risk of the
+# ORM generating something subtly different from what got benchmarked.
+INDEXED_NEARBY_STATIONS_SQL = text("""
+    SELECT id, external_id, name, latitude, longitude
+    FROM stations
+    WHERE location && ST_Expand(ST_SetSRID(ST_MakePoint(:lon, :lat), 4326), :radius_degrees)
+      AND ST_DWithin(
+        location::geography,
+        ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography,
+        :radius_meters
+    )
+""")
 
 app = FastAPI(
     title="Wildfire & Air Quality Risk API",
@@ -65,26 +94,45 @@ def health(db: Session = Depends(get_db)):
     }
 
 
-@app.get("/aqi/current")
-def current_aqi(lat: float, lon: float, radius_miles: float = 25, db: Session = Depends(get_db)):
+def _naive_nearby_stations(db: Session, lat: float, lon: float, radius_miles: float):
     """
-    Naive lat/lon filter: pull all stations, filter to a bounding box in
-    Python. This is the deliberately-unsophisticated Week 3 baseline that
-    BENCHMARKS.md measures against — Week 4 replaces this with a PostGIS
-    ST_DWithin query and records the real before/after numbers.
+    Pull every station row, filter to a bounding box in Python. Deliberately
+    unsophisticated — the Week 3 baseline BENCHMARKS.md measures against.
     """
     lat_delta = radius_miles / MILES_PER_DEGREE_LATITUDE
     lon_delta = radius_miles / (MILES_PER_DEGREE_LATITUDE * math.cos(math.radians(lat)))
 
     stations = db.query(Station).all()
-    nearby_stations = [
+    return [
         s for s in stations
         if (lat - lat_delta) <= s.latitude <= (lat + lat_delta)
         and (lon - lon_delta) <= s.longitude <= (lon + lon_delta)
     ]
 
+
+def _indexed_nearby_stations(db: Session, lat: float, lon: float, radius_miles: float):
+    """
+    PostGIS ST_DWithin query using the GiST index on Station.location —
+    the Week 4 comparison path. Returns SQLAlchemy Row objects, which
+    support the same .id/.name/.external_id/.latitude/.longitude attribute
+    access as ORM Station objects, so _readings_for_stations works
+    unchanged with either.
+    """
+    radius_meters = radius_miles * METERS_PER_MILE
+    # Same generous (longitude-adjusted) degrees conversion as the naive
+    # filter's lon_delta — the bounding box only needs to be a safe superset
+    # of the true circle; the precise ST_DWithin filter does the real work.
+    radius_degrees = radius_miles / (MILES_PER_DEGREE_LATITUDE * math.cos(math.radians(lat)))
+    result = db.execute(
+        INDEXED_NEARBY_STATIONS_SQL,
+        {"lat": lat, "lon": lon, "radius_meters": radius_meters, "radius_degrees": radius_degrees},
+    )
+    return result.all()
+
+
+def _readings_for_stations(db: Session, stations) -> list[dict]:
     readings = []
-    for station in nearby_stations:
+    for station in stations:
         station_readings = (
             db.query(Reading)
             .filter(Reading.station_id == station.id)
@@ -108,8 +156,30 @@ def current_aqi(lat: float, lon: float, radius_miles: float = 25, db: Session = 
                 "category": reading.category,
                 "observed_at": reading.observed_at.isoformat(),
             })
+    return readings
 
-    return {"count": len(readings), "readings": readings}
+
+@app.get("/aqi/current")
+def current_aqi(
+    lat: float,
+    lon: float,
+    radius_miles: float = 25,
+    method: str = "naive",
+    db: Session = Depends(get_db),
+):
+    """
+    method="naive" (default, unchanged from Week 3): Python-side bounding
+    box filter. method="indexed": PostGIS ST_DWithin using the GiST index.
+    Both exist side by side — not a replacement — so BENCHMARKS.md's
+    before/after numbers come from real, directly comparable code paths.
+    """
+    if method == "indexed":
+        nearby_stations = _indexed_nearby_stations(db, lat, lon, radius_miles)
+    else:
+        nearby_stations = _naive_nearby_stations(db, lat, lon, radius_miles)
+
+    readings = _readings_for_stations(db, nearby_stations)
+    return {"count": len(readings), "readings": readings, "method": method}
 
 
 @app.get("/aqi/history")

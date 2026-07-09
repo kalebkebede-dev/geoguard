@@ -16,12 +16,14 @@ from datetime import datetime
 
 import pytest
 from fastapi.testclient import TestClient
+from geoalchemy2.elements import WKTElement
 
 from app.api.main import app
 from app.db.models import Reading, Station
 from app.db.session import SessionLocal
 
 TEST_EXTERNAL_ID = "TEST-STATION, ZZ"
+TEST_LAT, TEST_LON = 10.0, 20.0
 
 
 @pytest.fixture
@@ -31,8 +33,9 @@ def test_station_with_reading():
     station = Station(
         external_id=TEST_EXTERNAL_ID,
         name="Test Station",
-        latitude=10.0,
-        longitude=20.0,
+        latitude=TEST_LAT,
+        longitude=TEST_LON,
+        location=WKTElement(f"POINT({TEST_LON} {TEST_LAT})", srid=4326),
     )
     session.add(station)
     session.flush()
@@ -56,7 +59,7 @@ def test_station_with_reading():
 
 def test_current_aqi_returns_nearby_reading(test_station_with_reading):
     client = TestClient(app)
-    response = client.get("/aqi/current", params={"lat": 10.0, "lon": 20.0})
+    response = client.get("/aqi/current", params={"lat": TEST_LAT, "lon": TEST_LON})
 
     assert response.status_code == 200
     data = response.json()
