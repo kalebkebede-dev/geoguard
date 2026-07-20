@@ -19,6 +19,21 @@ from geoalchemy2 import Geometry  # pip install geoalchemy2
 Base = declarative_base()
 
 
+class User(Base):
+    """
+    Just enough identity for saved-locations to be per-user — see
+    app/auth/security.py. No email verification, no password reset flow,
+    no roles; those aren't needed for the one feature this gates.
+    """
+
+    __tablename__ = "users"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String, unique=True, nullable=False)
+    hashed_password = Column(String, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+
+
 class Station(Base):
     __tablename__ = "stations"
 
@@ -51,6 +66,42 @@ class Reading(Base):
         # not a blind INSERT.
         UniqueConstraint("station_id", "pollutant", "observed_at", name="uq_reading_identity"),
     )
+
+
+class SavedLocation(Base):
+    __tablename__ = "saved_locations"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    label = Column(String, nullable=False)
+    latitude = Column(Float, nullable=False)
+    longitude = Column(Float, nullable=False)
+    created_at = Column(DateTime, nullable=False)
+
+    # The anti-double-fire gate. NULL = not currently in an alerted state.
+    # Set to the crossing timestamp when AQI first goes unhealthy (one
+    # email sent); left untouched (no new email) on every check while it's
+    # still unhealthy; reset to NULL once AQI recovers, so a *future*
+    # crossing can alert again. See app/alerts/check_alerts.py.
+    alert_active_since = Column(DateTime, nullable=True)
+
+
+class AlertLog(Base):
+    """
+    Append-only record of every alert email actually sent. Exists purely as
+    inspectable proof of what fired and when -- NOT used to decide whether
+    to send (that's SavedLocation.alert_active_since). Same purpose as
+    IngestionRun serves for the ingestion side: observability, not logic.
+    """
+
+    __tablename__ = "alert_log"
+
+    id = Column(Integer, primary_key=True)
+    saved_location_id = Column(Integer, ForeignKey("saved_locations.id"), nullable=False)
+    sent_at = Column(DateTime, nullable=False)
+    pollutant = Column(String, nullable=False)
+    aqi_value = Column(Integer, nullable=False)
+    category = Column(String, nullable=False)
 
 
 class IngestionRun(Base):

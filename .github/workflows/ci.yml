@@ -32,6 +32,10 @@ jobs:
       # No .env file exists in CI (it's gitignored) — both app/db/session.py
       # and migrations/env.py read this from the real process environment.
       DATABASE_URL: postgresql://geoguard:geoguard_dev_password@localhost:5432/geoguard
+      # Not a real secret -- only signs/verifies JWTs within this single
+      # ephemeral CI run, never used outside it. No reason to store this
+      # one in GitHub secrets the way DATABASE_URL/SENDGRID_API_KEY are.
+      JWT_SECRET_KEY: ci-test-only-jwt-secret-not-used-anywhere-real
 
     steps:
       - uses: actions/checkout@v4

@@ -2,7 +2,8 @@
 Entry point for the scheduled GitHub Actions ingestion job (see
 .github/workflows/ingest.yml). Ingests a handful of real US cities each run
 so the live deployed API has genuine, geographically diverse data rather
-than a single location.
+than a single location, then checks saved-location alerts against that
+freshly-ingested data.
 
 Each city is a separate run_ingestion() call, so each writes its own
 ingestion_runs row — /health reports on whichever ran most recently.
@@ -10,6 +11,8 @@ ingestion_runs row — /health reports on whichever ran most recently.
 
 import logging
 
+from app.alerts.check_alerts import check_alerts
+from app.db.session import SessionLocal
 from app.ingestion.fetch_airnow import run_ingestion
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -30,6 +33,14 @@ def main():
             run_ingestion(lat, lon)
         except Exception as exc:
             logger.error("Ingestion failed for %s: %s", name, exc)
+
+    session = SessionLocal()
+    try:
+        check_alerts(session)
+    except Exception:
+        logger.exception("Alert check failed")
+    finally:
+        session.close()
 
 
 if __name__ == "__main__":

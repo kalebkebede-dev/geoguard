@@ -6,51 +6,32 @@ Auto-generated docs will be at http://127.0.0.1:8000/docs — useful for testing
 and a good thing to screenshot for your README later.
 """
 
-import math
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from fastapi import Depends, FastAPI
-from sqlalchemy import text
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from app.db.models import IngestionRun, Reading, Station
+from app.aqi.lookup import indexed_nearby_stations, naive_nearby_stations, readings_for_stations
+from app.api.auth_routes import router as auth_router
+from app.api.locations_routes import router as locations_router
+from app.db.models import IngestionRun
 from app.db.session import get_db
-
-MILES_PER_DEGREE_LATITUDE = 69.0
-METERS_PER_MILE = 1609.34
-
-# Verified against EXPLAIN ANALYZE before adopting this shape — an earlier
-# version that only cast to ::geography (matching BENCHMARKS.md's original
-# sketch) turned out to force a Seq Scan: Station.location is stored as
-# geometry (SRID 4326, native units = degrees), and Postgres can't use a
-# GiST index built on the raw geometry column to accelerate a filter
-# expressed against a cast (::geography) version of that column.
-#
-# The fix, and the standard PostGIS idiom for this exact situation: a cheap
-# `&&` bounding-box check directly on the raw indexed geometry column (which
-# reliably uses the GiST index) narrows candidates first, then the precise
-# ::geography ST_DWithin (accurate real-world meters, unlike a plain
-# geometry-space degree distance) filters that small candidate set.
-#
-# Kept as a raw SQL string (not the ORM) so the exact same query can be
-# re-run with EXPLAIN ANALYZE when verifying index usage — no risk of the
-# ORM generating something subtly different from what got benchmarked.
-INDEXED_NEARBY_STATIONS_SQL = text("""
-    SELECT id, external_id, name, latitude, longitude
-    FROM stations
-    WHERE location && ST_Expand(ST_SetSRID(ST_MakePoint(:lon, :lat), 4326), :radius_degrees)
-      AND ST_DWithin(
-        location::geography,
-        ST_SetSRID(ST_MakePoint(:lon, :lat), 4326)::geography,
-        :radius_meters
-    )
-""")
 
 app = FastAPI(
     title="Wildfire & Air Quality Risk API",
     description="Real-time air quality and wildfire risk data.",
     version="0.1.0",
 )
+app.include_router(auth_router)
+app.include_router(locations_router)
+
+# Mounted at /app (not /) so it doesn't collide with the JSON status route
+# at "/" below. Served from this same FastAPI process, not a separate
+# frontend host -- keeps it same-origin (no CORS) and one deployment target.
+FRONTEND_DIR = Path(__file__).resolve().parent.parent.parent / "frontend"
+app.mount("/app", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")
 
 # Placeholder until the real GitHub Actions cron schedule is set (Week 3/4) —
 # AirNow updates roughly hourly, so 2 hours gives a buffer before flagging
@@ -94,71 +75,6 @@ def health(db: Session = Depends(get_db)):
     }
 
 
-def _naive_nearby_stations(db: Session, lat: float, lon: float, radius_miles: float):
-    """
-    Pull every station row, filter to a bounding box in Python. Deliberately
-    unsophisticated — the Week 3 baseline BENCHMARKS.md measures against.
-    """
-    lat_delta = radius_miles / MILES_PER_DEGREE_LATITUDE
-    lon_delta = radius_miles / (MILES_PER_DEGREE_LATITUDE * math.cos(math.radians(lat)))
-
-    stations = db.query(Station).all()
-    return [
-        s for s in stations
-        if (lat - lat_delta) <= s.latitude <= (lat + lat_delta)
-        and (lon - lon_delta) <= s.longitude <= (lon + lon_delta)
-    ]
-
-
-def _indexed_nearby_stations(db: Session, lat: float, lon: float, radius_miles: float):
-    """
-    PostGIS ST_DWithin query using the GiST index on Station.location —
-    the Week 4 comparison path. Returns SQLAlchemy Row objects, which
-    support the same .id/.name/.external_id/.latitude/.longitude attribute
-    access as ORM Station objects, so _readings_for_stations works
-    unchanged with either.
-    """
-    radius_meters = radius_miles * METERS_PER_MILE
-    # Same generous (longitude-adjusted) degrees conversion as the naive
-    # filter's lon_delta — the bounding box only needs to be a safe superset
-    # of the true circle; the precise ST_DWithin filter does the real work.
-    radius_degrees = radius_miles / (MILES_PER_DEGREE_LATITUDE * math.cos(math.radians(lat)))
-    result = db.execute(
-        INDEXED_NEARBY_STATIONS_SQL,
-        {"lat": lat, "lon": lon, "radius_meters": radius_meters, "radius_degrees": radius_degrees},
-    )
-    return result.all()
-
-
-def _readings_for_stations(db: Session, stations) -> list[dict]:
-    readings = []
-    for station in stations:
-        station_readings = (
-            db.query(Reading)
-            .filter(Reading.station_id == station.id)
-            .order_by(Reading.observed_at.desc())
-            .all()
-        )
-        # station_readings is newest-first, so the first time we see a given
-        # pollutant here is guaranteed to be its most recent reading.
-        seen_pollutants = set()
-        for reading in station_readings:
-            if reading.pollutant in seen_pollutants:
-                continue
-            seen_pollutants.add(reading.pollutant)
-            readings.append({
-                "station_name": station.name,
-                "station_external_id": station.external_id,
-                "latitude": station.latitude,
-                "longitude": station.longitude,
-                "pollutant": reading.pollutant,
-                "aqi_value": reading.aqi_value,
-                "category": reading.category,
-                "observed_at": reading.observed_at.isoformat(),
-            })
-    return readings
-
-
 @app.get("/aqi/current")
 def current_aqi(
     lat: float,
@@ -174,11 +90,11 @@ def current_aqi(
     before/after numbers come from real, directly comparable code paths.
     """
     if method == "indexed":
-        nearby_stations = _indexed_nearby_stations(db, lat, lon, radius_miles)
+        nearby_stations = indexed_nearby_stations(db, lat, lon, radius_miles)
     else:
-        nearby_stations = _naive_nearby_stations(db, lat, lon, radius_miles)
+        nearby_stations = naive_nearby_stations(db, lat, lon, radius_miles)
 
-    readings = _readings_for_stations(db, nearby_stations)
+    readings = readings_for_stations(db, nearby_stations)
     return {"count": len(readings), "readings": readings, "method": method}
 
 

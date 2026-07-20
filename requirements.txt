@@ -9,3 +9,5 @@ pytest
 python-dotenv
 pandas
 httpx2
+bcrypt
+pyjwt
