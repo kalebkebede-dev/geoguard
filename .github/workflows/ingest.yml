@@ -23,8 +23,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run scheduled ingestion
+      - name: Run scheduled ingestion and check alerts
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           AIRNOW_API_KEY: ${{ secrets.AIRNOW_API_KEY }}
+          SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
+          ALERT_FROM_EMAIL: ${{ secrets.ALERT_FROM_EMAIL }}
         run: python -m scripts.run_scheduled_ingestion
