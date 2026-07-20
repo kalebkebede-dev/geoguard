@@ -113,6 +113,55 @@ Throughout: LeetCode and applications continue every week regardless of where
 the project timeline lands. This project supports the job search — it doesn't
 replace the other two tracks.
 
+## Failure modes
+
+A system is only as trustworthy as what happens when something breaks. Four
+failure modes this project handles deliberately, not accidentally:
+
+**AirNow API is down or slow.** `fetch_current_observations()` retries up to
+3 times with exponential backoff (1s, 2s, 4s) before giving up — but only for
+transient failures (network errors, 5xx responses). A 4xx response (bad API
+key, malformed request) fails immediately without retrying, since retrying a
+request that's wrong won't make it right. If all retries are exhausted, the
+run doesn't fail silently: `run_ingestion()` catches the exception, writes an
+`ingestion_runs` row with `success=False` and the real error message, then
+re-raises so the process still exits non-zero (visible to GitHub Actions).
+`/health` reflects this immediately — `healthy = last_run.success and
+time_since_last_run <= HEALTHY_INTERVAL`, so a failed run reports unhealthy
+right away, not just once it becomes stale.
+
+**A single malformed record.** Each reading in a batch is processed inside
+its own `session.begin_nested()` (a SQL SAVEPOINT). If `normalize_reading()`
+or the upsert raises for one reading — a missing field, an unexpected shape —
+only that reading's SAVEPOINT rolls back; the exception is logged
+(`logger.exception`, full traceback) and the loop continues. The rest of the
+batch, including readings already saved earlier in the same run, is
+unaffected. The run itself is still recorded as `success=True` with a
+nonzero `error_count` — a malformed record and a broken run are different
+signals, and conflating them would make `/health` cry wolf over data quality
+issues that didn't actually stop the pipeline.
+
+**Overlapping or rerun ingestion.** The `uq_reading_identity` UNIQUE
+constraint on `(station_id, pollutant, observed_at)`, combined with `INSERT
+... ON CONFLICT DO UPDATE`, means two overlapping runs (a scheduled run and a
+manual test run, or a retried GitHub Actions job) converge on one row per
+identity, not duplicates. This is enforced at the database level, not by
+application-level "check before insert" logic that a race condition could
+slip past.
+
+**Double-firing the same alert.** Proven this session, not just designed:
+`SavedLocation.alert_active_since` is a nullable gate — `NULL` means "not
+currently alerted." A fresh unhealthy crossing sends one email and sets the
+gate; every subsequent check while still unhealthy sees the gate is set and
+suppresses; recovery to healthy clears the gate so a *future* crossing can
+alert again. Verified end-to-end with a real saved location, a forced
+unhealthy reading, and a real SendGrid send: exactly one email arrived, and a
+second check against the same unhealthy state produced zero additional
+emails and zero new `alert_log` rows — see `app/alerts/check_alerts.py` and
+`tests/test_alerts.py` for the five scenarios this locks in (fresh crossing,
+suppressed repeat, recovery, healthy-never-alerts, and a failed send not
+falsely setting the gate).
+
 ## What "done" looks like for your resume
 
 - A live public API URL you can click and see real data
